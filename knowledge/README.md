@@ -40,7 +40,7 @@ python3 scripts/extract_all_ast_pairs.py --stdlib
 
 # Run the full probe (requires MLX on Apple Silicon)
 pip install mlx mlx-lm
-python3 scripts/probe_mlx.py
+python3 scripts/probe_mlx.py --model google/gemma-3-4b-it
 
 # Run tests
 python3 -m pytest tests/ -v
@@ -111,7 +111,7 @@ src/larql_knowledge/          # Python package (pip installable)
   triples.py                  # Triple loading, assembly, merging
   cli.py                      # CLI entry point
 
-tests/                        # 666 tests
+tests/                        # 680 tests
   test_triples_format.py      #   Validates all 144 triple files
   test_templates.py           #   Validates 142 template relations
   test_treesitter_extract.py  #   23 tests for 19-language AST extraction
@@ -122,6 +122,7 @@ tests/                        # 666 tests
   test_labels.py              #   Probe label format
   test_probe_output.py        #   Probe output validation
   test_triples.py             #   Triple loading/merging
+  test_probe_matching.py      #   Normalize + match index logic (14 tests)
 ```
 
 ## Data Pipeline
@@ -176,6 +177,8 @@ Strategy 2 (prediction matching):
 
 Strategy 2 captures what the model actually predicts (e.g. "Macron" for "The president of France is"), then matches against normalized triple objects (e.g. "Emmanuel Macron" -> ["emmanuel macron", "macron", "emmanuel"]).
 
+The probe is **model-agnostic** (auto-detects Gemma, Llama, Mistral, Qwen, etc.) and **decoupled from the vindex** (prediction matching works without one; gate matching adds detail when a vindex is available).
+
 **157 probe-confirmed features** for gemma-3-4b-it across 17 relations.
 
 ## Examples
@@ -206,7 +209,7 @@ python3 scripts/assemble_triples.py
 # "habitat": ["The natural habitat of a {X} is", "{X} lives in"]
 
 # 4. Re-run probe to discover features for this relation
-python3 scripts/probe_mlx.py
+python3 scripts/probe_mlx.py --model google/gemma-3-4b-it
 ```
 
 ### Extracting AST Pairs for a New Language
@@ -273,8 +276,8 @@ python3 scripts/fetch_wordnet_relations.py
 python3 scripts/fetch_morphological.py
 python3 scripts/extract_all_ast_pairs.py --stdlib
 
-# 3. Probe (requires MLX + model)
-python3 scripts/probe_mlx.py
+# 3. Probe (requires MLX + model — works with any model)
+python3 scripts/probe_mlx.py --model google/gemma-3-4b-it
 
 # 4. Validate
 python3 -m pytest tests/ -v
@@ -374,30 +377,44 @@ Each relation should have 2-3 template variants to maximize probe coverage.
 
 ### Running Probes for a New Model
 
+The probe is model-agnostic and decoupled from the vindex. You can probe any MLX-compatible model:
+
 ```bash
-# 1. Build the vindex (in the larql repo)
-larql extract-index google/gemma-3-4b-it -o output/gemma3-4b.vindex
+# Prediction-only mode (no vindex needed)
+python3 scripts/probe_mlx.py --model google/gemma-3-4b-it
+python3 scripts/probe_mlx.py --model mlx-community/Meta-Llama-3-8B-4bit
 
-# 2. Run the probe
-python3 scripts/probe_mlx.py
+# With vindex (enables gate matching + prediction matching)
+python3 scripts/probe_mlx.py --model google/gemma-3-4b-it --vindex output/gemma3-4b.vindex
 
-# 3. Labels are saved to both:
-#    - output/gemma3-4b-full.vindex/feature_labels.json (for the engine)
-#    - probes/gemma-3-4b-it/feature_labels.json (for comparison)
+# Full options
+python3 scripts/probe_mlx.py \
+  --model <model_id> \
+  --vindex <path_to_vindex> \
+  --triples data/wikidata_triples.json \
+  --templates data/probe_templates.json \
+  --output probes/ \
+  --top-k 50 \
+  --min-gate-score 5.0
+
+# Labels are saved to:
+#   probes/<model-slug>/feature_labels.json (always)
+#   <vindex>/feature_labels.json (if vindex provided)
 ```
 
 ## Testing
 
 ```bash
-# Run all 666 tests
+# Run all 680 tests
 python3 -m pytest tests/ -v
 
 # Run specific test groups
-python3 -m pytest tests/test_triples_format.py -v   # Validate all 144 triple files
-python3 -m pytest tests/test_templates.py -v         # Validate 426 templates
-python3 -m pytest tests/test_treesitter_extract.py -v # AST extraction (19 languages)
-python3 -m pytest tests/test_morphological.py -v     # Morphological pairs
-python3 -m pytest tests/test_wikidata_combined.py -v # Combined triples
+python3 -m pytest tests/test_triples_format.py -v      # Validate all 144 triple files
+python3 -m pytest tests/test_templates.py -v            # Validate 426 templates
+python3 -m pytest tests/test_treesitter_extract.py -v   # AST extraction (19 languages)
+python3 -m pytest tests/test_probe_matching.py -v       # Normalize + match index logic
+python3 -m pytest tests/test_morphological.py -v        # Morphological pairs
+python3 -m pytest tests/test_wikidata_combined.py -v    # Combined triples
 ```
 
 ## Current Stats
@@ -408,7 +425,7 @@ python3 -m pytest tests/test_wikidata_combined.py -v # Combined triples
 - **10 morphological relations**, 3,952 pairs
 - **5 AST languages** (Python, Rust, JavaScript, TypeScript, C), 13,012 pairs
 - **157 probe-confirmed features** for gemma-3-4b-it
-- **666 tests**, all passing
+- **680 tests**, all passing
 
 ## Label Priority
 
