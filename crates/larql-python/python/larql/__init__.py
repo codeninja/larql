@@ -21,6 +21,7 @@ from larql._native import (
     DescribeEdge,
     Relation,
     Session,
+    WalkModel,
 
     # Graph types
     Edge,

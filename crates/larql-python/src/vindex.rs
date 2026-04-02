@@ -865,6 +865,52 @@ impl PyVindex {
         }
     }
 
+    // ══════════════════════════════════════════════
+    //  INFER — full forward pass with walk FFN
+    // ══════════════════════════════════════════════
+
+    /// Run inference: full forward pass with vindex walk FFN.
+    ///
+    /// Loads model weights from the vindex (requires --level all),
+    /// runs attention + sparse FFN through all layers, returns predictions.
+    ///
+    /// This is the Rust inference engine — no MLX, no Python overhead.
+    /// The vindex gate KNN selects features, sparse FFN computes output.
+    ///
+    /// Args:
+    ///     prompt: input text
+    ///     top_k_predictions: number of top predictions to return (default 5)
+    ///     top_k_features: features per layer for walk FFN (default 8192, lossless)
+    ///
+    /// Returns:
+    ///     List of (token, probability) tuples
+    #[pyo3(signature = (prompt, top_k_predictions=5, top_k_features=8192))]
+    fn infer(
+        &self, prompt: &str, top_k_predictions: usize, top_k_features: usize
+    ) -> PyResult<Vec<(String, f64)>> {
+        let dir = std::path::Path::new(&self.path);
+
+        // Load model weights from vindex
+        let mut load_cb = larql_vindex::SilentLoadCallbacks;
+        let weights = larql_vindex::load_model_weights(dir, &mut load_cb)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("Failed to load model weights: {e}")
+            ))?;
+
+        // Tokenize prompt (with BOS token for correct inference)
+        let encoding = self.tokenizer.encode(prompt, true)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let token_ids: Vec<u32> = encoding.get_ids().to_vec();
+
+        // Run forward pass with walk FFN
+        let walk_ffn = larql_inference::WalkFfn::new(&weights, &self.index, top_k_features);
+        let result = larql_inference::predict_with_ffn(
+            &weights, &self.tokenizer, &token_ids, top_k_predictions, &walk_ffn
+        );
+
+        Ok(result.predictions)
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "Vindex(model='{}', layers={}, hidden={}, features={})",

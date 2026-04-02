@@ -13,7 +13,6 @@ import json
 from pathlib import Path
 from typing import Optional, Tuple
 
-import numpy as np
 
 
 def _weight_prefix(config: dict) -> Tuple[str, str]:
@@ -28,9 +27,10 @@ def _weight_prefix(config: dict) -> Tuple[str, str]:
 def _load_weights(vindex_path: str) -> dict:
     """Mmap vindex binaries and produce {tensor_name: mx.array} dict.
 
-    Mmap'd numpy views are converted to mx.array in bfloat16 (what MLX uses
-    natively). For f32 vindexes this halves memory and speeds up load.
+    Uses memoryview.cast() to create mx.array directly from mmap'd
+    memory — bypasses numpy entirely for f16 vindexes.
     """
+    import mmap as mmap_mod
     import mlx.core as mx
 
     vpath = Path(vindex_path)
@@ -41,69 +41,92 @@ def _load_weights(vindex_path: str) -> dict:
         manifest = json.load(f)
 
     dtype_str = config.get("dtype", "f32")
-    np_dtype = np.float16 if dtype_str == "f16" else np.float32
     hidden = config["hidden_size"]
     prefix, lm_prefix = _weight_prefix(config)
 
-    def to_mx(view):
-        return mx.array(view)
+    # memoryview format codes: 'e' = f16, 'f' = f32
+    mv_fmt = "e" if dtype_str == "f16" else "f"
 
     # Mmap each binary file once
+    open_files = {}
     mmaps = {}
-    for entry in manifest:
-        fname = entry["file"]
+
+    def get_mmap(fname):
         if fname not in mmaps:
             fpath = vpath / fname
             if fpath.exists():
-                mmaps[fname] = np.memmap(str(fpath), dtype=np.uint8, mode="r")
+                fh = open(fpath, "rb")
+                mm = mmap_mod.mmap(fh.fileno(), 0, access=mmap_mod.ACCESS_READ)
+                open_files[fname] = fh
+                mmaps[fname] = mm
+        return mmaps.get(fname)
+
+    def mmap_to_mx(mm, offset, length, shape):
+        """Create mx.array from mmap slice via memoryview. No numpy."""
+        buf = mm[offset:offset + length]
+        mv = memoryview(buf).cast(mv_fmt, shape)
+        return mx.array(mv)
 
     weights = {}
 
-    # Manifest weights (attention, FFN up/down, norms, lm_head)
-    for entry in manifest:
-        raw_name = entry["key"]
-        if "vision_tower" in raw_name or "multi_modal" in raw_name:
-            continue
+    try:
+        # Manifest weights (attention, FFN up/down, norms)
+        for entry in manifest:
+            raw_name = entry["key"]
+            if "vision_tower" in raw_name or "multi_modal" in raw_name:
+                continue
 
-        fname = entry["file"]
-        if fname not in mmaps:
-            continue
+            mm = get_mmap(entry["file"])
+            if mm is None:
+                continue
 
-        shape = tuple(entry["shape"])
-        offset = entry["offset"]
-        length = entry["length"]
+            shape = tuple(entry["shape"])
+            offset = entry["offset"]
+            length = entry["length"]
 
-        view = mmaps[fname][offset:offset + length].view(np_dtype).reshape(shape)
+            if raw_name == "lm_head.weight":
+                name = f"{lm_prefix}lm_head.weight"
+            elif raw_name == "norm.weight":
+                name = f"{prefix}norm.weight"
+            else:
+                name = f"{prefix}{raw_name}"
 
-        if raw_name == "lm_head.weight":
-            name = f"{lm_prefix}lm_head.weight"
-        elif raw_name == "norm.weight":
-            name = f"{prefix}norm.weight"
-        else:
-            name = f"{prefix}{raw_name}"
+            weights[name] = mmap_to_mx(mm, offset, length, shape)
 
-        weights[name] = to_mx(view)
+        # Embeddings
+        embed_path = vpath / "embeddings.bin"
+        if embed_path.exists():
+            vocab = config.get("vocab_size", 0)
+            if vocab > 0:
+                fh = open(embed_path, "rb")
+                mm = mmap_mod.mmap(fh.fileno(), 0, access=mmap_mod.ACCESS_READ)
+                open_files["embeddings.bin"] = fh
+                weights[f"{prefix}embed_tokens.weight"] = mmap_to_mx(
+                    mm, 0, vocab * hidden * (2 if dtype_str == "f16" else 4),
+                    (vocab, hidden)
+                )
 
-    # Embeddings
-    embed_path = vpath / "embeddings.bin"
-    if embed_path.exists():
-        vocab = config.get("vocab_size", 0)
-        if vocab > 0:
-            em = np.memmap(str(embed_path), dtype=np_dtype, mode="r",
-                           shape=(vocab, hidden))
-            weights[f"{prefix}embed_tokens.weight"] = to_mx(em)
+        # FFN gate (gate_vectors.bin = mlp.gate_proj.weight)
+        gate_path = vpath / "gate_vectors.bin"
+        if gate_path.exists():
+            fh = open(gate_path, "rb")
+            gate_mm = mmap_mod.mmap(fh.fileno(), 0, access=mmap_mod.ACCESS_READ)
+            open_files["gate_vectors.bin"] = fh
+            for info in config.get("layers", []):
+                layer = info["layer"]
+                nf = info["num_features"]
+                off = info["offset"]
+                length = info["length"]
+                weights[f"{prefix}layers.{layer}.mlp.gate_proj.weight"] = mmap_to_mx(
+                    gate_mm, off, length, (nf, hidden)
+                )
 
-    # FFN gate (gate_vectors.bin = mlp.gate_proj.weight)
-    gate_path = vpath / "gate_vectors.bin"
-    if gate_path.exists():
-        gate_mm = np.memmap(str(gate_path), dtype=np.uint8, mode="r")
-        for info in config.get("layers", []):
-            layer = info["layer"]
-            nf = info["num_features"]
-            off = info["offset"]
-            length = info["length"]
-            view = gate_mm[off:off + length].view(np_dtype).reshape(nf, hidden)
-            weights[f"{prefix}layers.{layer}.mlp.gate_proj.weight"] = to_mx(view)
+    finally:
+        # Close mmaps and files after mx.array has copied the data
+        for mm in mmaps.values():
+            mm.close()
+        for fh in open_files.values():
+            fh.close()
 
     return weights
 

@@ -6,9 +6,11 @@ use larql_inference as li;
 
 mod vindex;
 mod session;
+mod walk;
 
 use vindex::{PyVindex, PyFeatureMeta, PyWalkHit, PyDescribeEdge, PyRelation};
 use session::PySession;
+use walk::PyWalkModel;
 
 // ── Helpers ──
 
@@ -758,6 +760,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDescribeEdge>()?;
     m.add_class::<PyRelation>()?;
     m.add_class::<PySession>()?;
+    m.add_class::<PyWalkModel>()?;
 
     // Graph functions (existing)
     m.add_function(wrap_pyfunction!(load, m)?)?;
