@@ -33,20 +33,46 @@ pub fn precompute_per_layer_inputs(
     let seq_len = token_ids.len();
     let hidden = weights.hidden_size;
 
-    // Stream 1: model projection from main embeddings
-    let w_model_proj = match weights.tensors.get("per_layer_model_projection.weight") {
-        Some(w) => w,
-        None => return Vec::new(),
-    };
+    // Stream 1: model projection from main embeddings.
+    //
+    // Hard expect() on the tensor: the vindex loader at
+    // `larql-vindex/src/format/weights/load.rs::validate_ple_invariants`
+    // refuses to construct a `ModelWeights` for a PLE-enabled
+    // architecture without this tensor, so reaching this code with the
+    // key absent indicates loader / writer / arch drift, not user
+    // error. Silent fallbacks here previously produced garbage INFER
+    // output (chrishayuk/larql#49); panic instead.
+    let w_model_proj = weights
+        .tensors
+        .get("per_layer_model_projection.weight")
+        .expect(
+            "PLE arch is missing `per_layer_model_projection.weight` — \
+             vindex was constructed without `validate_ple_invariants`; \
+             rebuild it with current larql",
+        );
     let projected = dot_proj(main_embeds, w_model_proj);
     let model_proj_scale = (hidden as f32).powf(-0.5);
 
-    // Stream 2: per-layer token embeddings
-    let ple_embed = weights.tensors.get("embed_tokens_per_layer.weight");
+    // Stream 2: per-layer token embeddings. Loader-validated.
+    let ple_embed = weights
+        .tensors
+        .get("embed_tokens_per_layer.weight")
+        .expect(
+            "PLE arch is missing `embed_tokens_per_layer.weight` — \
+             vindex was constructed without `validate_ple_invariants`; \
+             rebuild it with current larql",
+        );
     let embed_scale = (ple_dim as f32).sqrt();
 
-    // Per-layer projection norm weight
-    let proj_norm_w = weights.vectors.get("per_layer_projection_norm.weight");
+    // Per-layer projection norm weight. Loader-validated.
+    let proj_norm_w = weights
+        .vectors
+        .get("per_layer_projection_norm.weight")
+        .expect(
+            "PLE arch is missing `per_layer_projection_norm.weight` — \
+             vindex was constructed without `validate_ple_invariants`; \
+             rebuild it with current larql",
+        );
     let norm_offset = arch.norm_weight_offset();
 
     let norm_eps = arch.norm_eps() as f32;
@@ -63,26 +89,24 @@ pub fn precompute_per_layer_inputs(
                 layer_input[[s, d]] = val;
             }
 
-            // Apply RMSNorm to stream 1 for this position
-            if let Some(norm_w) = proj_norm_w {
-                let mut sq_sum = 0.0f32;
-                for d in 0..ple_dim {
-                    sq_sum += layer_input[[s, d]] * layer_input[[s, d]];
-                }
-                let rms = (sq_sum / ple_dim as f32 + norm_eps).sqrt();
-                let inv_rms = 1.0 / rms;
-                for d in 0..ple_dim {
-                    layer_input[[s, d]] *= inv_rms * (norm_offset + norm_w[d]);
-                }
+            // Apply RMSNorm to stream 1 for this position. `proj_norm_w`
+            // is loader-validated to be present, so this is unconditional.
+            let mut sq_sum = 0.0f32;
+            for d in 0..ple_dim {
+                sq_sum += layer_input[[s, d]] * layer_input[[s, d]];
+            }
+            let rms = (sq_sum / ple_dim as f32 + norm_eps).sqrt();
+            let inv_rms = 1.0 / rms;
+            for d in 0..ple_dim {
+                layer_input[[s, d]] *= inv_rms * (norm_offset + proj_norm_w[d]);
             }
 
-            // Add stream 2: per-layer token embedding
-            if let Some(embed) = ple_embed {
-                let tok = token_ids[s] as usize;
-                let row = embed.row(tok);
-                for d in 0..ple_dim {
-                    layer_input[[s, d]] += row[col_start + d] * embed_scale;
-                }
+            // Add stream 2: per-layer token embedding. `ple_embed` is
+            // loader-validated to be present.
+            let tok = token_ids[s] as usize;
+            let row = ple_embed.row(tok);
+            for d in 0..ple_dim {
+                layer_input[[s, d]] += row[col_start + d] * embed_scale;
             }
 
             // Scale combined by 1/sqrt(2)
@@ -112,27 +136,46 @@ pub(crate) fn apply_per_layer_embedding(
     per_layer_input: Option<&Array2<f32>>,
 ) -> Array2<f32> {
     let arch = &*weights.arch;
+    // `per_layer_input` is None when the caller didn't precompute the
+    // PLE inputs — that's a real architectural state (caller knows
+    // PLE isn't in play and skipped the precompute). The loader's
+    // `validate_ple_invariants` only fires when the arch *does*
+    // declare PLE, so this branch isn't a missing-data fallback —
+    // it's the dispatcher path that already decided "don't apply PLE."
     let per_layer_input = match per_layer_input {
         Some(p) => p,
         None => return h.clone(),
     };
 
-    let gate_key = match arch.per_layer_input_gate_key(layer) {
-        Some(k) => k,
-        None => return h.clone(),
-    };
-    let proj_key = match arch.per_layer_projection_key(layer) {
-        Some(k) => k,
-        None => return h.clone(),
-    };
-    let w_gate = match weights.tensors.get(&gate_key) {
-        Some(w) => w,
-        None => return h.clone(),
-    };
-    let w_proj = match weights.tensors.get(&proj_key) {
-        Some(w) => w,
-        None => return h.clone(),
-    };
+    // Past this point the arch must have PLE (we have a per_layer_input
+    // for it) and the loader must have validated every key — so
+    // missing keys here are bugs, not data gaps. expect() rather than
+    // silent fall-through (chrishayuk/larql#49).
+    let gate_key = arch.per_layer_input_gate_key(layer).unwrap_or_else(|| {
+        panic!(
+            "apply_per_layer_embedding called for layer {layer} on an arch \
+             that returns None for per_layer_input_gate_key — caller fed a \
+             per_layer_input on a non-PLE arch"
+        )
+    });
+    let proj_key = arch.per_layer_projection_key(layer).unwrap_or_else(|| {
+        panic!(
+            "apply_per_layer_embedding called for layer {layer} on an arch \
+             that returns None for per_layer_projection_key"
+        )
+    });
+    let w_gate = weights.tensors.get(&gate_key).unwrap_or_else(|| {
+        panic!(
+            "PLE tensor `{gate_key}` missing — vindex was constructed without \
+             `validate_ple_invariants`; rebuild it with current larql"
+        )
+    });
+    let w_proj = weights.tensors.get(&proj_key).unwrap_or_else(|| {
+        panic!(
+            "PLE tensor `{proj_key}` missing — vindex was constructed without \
+             `validate_ple_invariants`; rebuild it with current larql"
+        )
+    });
 
     // gate = h @ w_gate.T → [seq, ple_dim]
     let mut gate = dot_proj(h, w_gate);
@@ -189,9 +232,13 @@ mod tests {
     }
 
     #[test]
-    fn precompute_returns_empty_when_projection_weight_missing() {
-        // Even if arch claims PLE support, missing weight → empty return.
-        // TinyModel arch doesn't enable PLE so this exercises the same early exit.
+    fn precompute_returns_empty_when_arch_has_no_ple_even_with_missing_weights() {
+        // Sanity: TinyModel arch reports has_per_layer_embeddings()=false,
+        // so the function early-returns *before* it tries to look up any
+        // PLE tensor — the previous "missing weight → empty" fall-through
+        // is gone (chrishayuk/larql#49) and would now panic, but on a
+        // non-PLE arch the early-return short-circuits and the call is
+        // safe even with no PLE tensors loaded.
         let weights = make_test_weights();
         let embeds = Array2::zeros((1, weights.hidden_size));
         let result = precompute_per_layer_inputs(&weights, &embeds, &[0u32]);
@@ -205,19 +252,24 @@ mod tests {
         let weights = make_test_weights();
         let h = input(2, weights.hidden_size);
         let result = apply_per_layer_embedding(&weights, &h, 0, None);
-        // None per_layer_input → h returned unchanged
+        // None per_layer_input → caller-driven skip path (e.g. non-PLE
+        // dispatcher). h is returned unchanged.
         assert_eq!(result, h, "None per_layer_input should return h unchanged");
     }
 
     #[test]
-    fn apply_ple_missing_gate_weight_returns_h_unchanged() {
+    #[should_panic(expected = "per_layer_input_gate_key")]
+    fn apply_ple_panics_when_arch_has_no_per_layer_gate_key() {
+        // Regression contract for chrishayuk/larql#49: when a caller
+        // hands `apply_per_layer_embedding` a `Some(per_layer_input)`
+        // but the architecture has no PLE keys, that's a dispatcher
+        // bug — panic instead of silently returning h unchanged. The
+        // old code would no-op here and produce garbage at INFER time
+        // on a real Gemma-4 vindex without PLE tensors.
         let weights = make_test_weights();
         let h = input(1, weights.hidden_size);
-        // Provide a per_layer_input, but TinyModel has no per_layer gate tensors
         let dummy_input = Array2::zeros((1, 4));
-        let result = apply_per_layer_embedding(&weights, &h, 0, Some(&dummy_input));
-        // Gate key doesn't exist in TinyModel → returns h unchanged
-        assert_eq!(result, h, "missing gate weight should return h unchanged");
+        let _ = apply_per_layer_embedding(&weights, &h, 0, Some(&dummy_input));
     }
 
     #[test]
