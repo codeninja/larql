@@ -97,6 +97,16 @@ pub fn layer_weights_filename(layer: usize) -> String {
 pub const LM_HEAD_BIN: &str = "lm_head.bin";
 pub const LM_HEAD_Q4_BIN: &str = "lm_head_q4.bin";
 
+// ── Per-Layer Embedding sidecar (Gemma 4 E2B / E4B) ────────────────────
+//
+// Holds the four 2-D PLE tensors (`per_layer_model_projection.weight`,
+// `embed_tokens_per_layer.weight`, plus per-layer `per_layer_input_gate.weight`
+// and `per_layer_projection.weight`) as f16. The PLE norms +
+// `layer_scalar` vectors live in `norms.bin` next to the rest of the
+// model norms. Both float (`--quant none/f16`) and Q4_K extracts emit
+// this file; the loader hydrates it via the `tensor_f16` manifest entries.
+pub const PLE_WEIGHTS_BIN: &str = "ple_weights.bin";
+
 // ── FP4 / FP8 projections (exp 26) ─────────────────────────────────────
 pub const GATE_VECTORS_FP4_BIN: &str = "gate_vectors_fp4.bin";
 pub const UP_FEATURES_FP4_BIN: &str = "up_features_fp4.bin";
@@ -172,6 +182,7 @@ mod tests {
             ATTN_WEIGHTS_Q8_MANIFEST_JSON,
             LM_HEAD_BIN,
             LM_HEAD_Q4_BIN,
+            PLE_WEIGHTS_BIN,
         ];
         let unique: std::collections::HashSet<_> = names.iter().collect();
         assert_eq!(unique.len(), names.len(), "duplicate filename constant");

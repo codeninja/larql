@@ -525,6 +525,98 @@ pub fn write_model_weights_with_opts(
         norms_file.flush()?;
     }
 
+    // ── ple_weights.bin — Per-Layer Embedding tensors (Gemma 4 E2B/E4B) ──
+    //
+    // Mirror of the Q4_K writer's PLE block (see
+    // `write_q4k/mod.rs::write_model_weights_q4k_with_opts` ~lines 491-575).
+    // The four PLE 2-D tensors land in a sidecar `ple_weights.bin` as f16,
+    // *not* in the main float weight files — the on-disk layout matches the
+    // Q4_K extract so the same loader path can hydrate either kind. f16
+    // (instead of the global `dtype`) is deliberate: Q4_K writers chose f16
+    // for these tensors because Q4_K's per-super-block calibration zeros
+    // out non-outlier cells of embedding-style tensors and the resulting
+    // noise compounds across every layer's PLE residual add. f16 keeps
+    // float extracts on the same precision floor as q4k extracts so the
+    // same loader and forward-pass code can drive both without surprise.
+    //
+    // Without this block, extracting `gemma-4-E4B-it` at `--quant none`
+    // silently drops 129 PLE tensors and `precompute_per_layer_inputs`
+    // returns an empty `Vec` at inference time — INFER then produces
+    // garbage with no warning. See chrishayuk/larql#49 for the full
+    // diagnosis.
+    if write_attn && arch.has_per_layer_embeddings() {
+        let ple_path = dir.join(PLE_WEIGHTS_BIN);
+        let mut ple_file = BufWriter::new(std::fs::File::create(&ple_path)?);
+        let mut ple_offset: u64 = 0;
+        let ple_dtype = crate::config::dtype::StorageDtype::F16;
+
+        let write_tensor = |file: &mut BufWriter<std::fs::File>,
+                            manifest: &mut Vec<WeightEntry>,
+                            offset: &mut u64,
+                            key: String,
+                            data: Option<(Vec<f32>, usize, usize)>|
+         -> Result<(), VindexError> {
+            if let Some((floats, rows, cols)) = data {
+                let bytes = crate::config::dtype::encode_floats(&floats, ple_dtype);
+                file.write_all(&bytes)?;
+                manifest.push(WeightEntry {
+                    key,
+                    kind: kind::TENSOR_F16.into(),
+                    shape: vec![rows, cols],
+                    offset: *offset,
+                    length: bytes.len() as u64,
+                    file: PLE_WEIGHTS_BIN.into(),
+                });
+                *offset += bytes.len() as u64;
+            }
+            Ok(())
+        };
+
+        // Global: model projection [ple_dim·num_layers, hidden]
+        write_tensor(
+            &mut ple_file,
+            &mut entries,
+            &mut ple_offset,
+            "per_layer_model_projection.weight".into(),
+            source.get_tensor("per_layer_model_projection.weight"),
+        )?;
+
+        // Global: per-token embedding table [vocab, ple_dim·num_layers]
+        if let Some(key) = arch.per_layer_embed_key() {
+            write_tensor(
+                &mut ple_file,
+                &mut entries,
+                &mut ple_offset,
+                key.clone(),
+                source.get_tensor(&key),
+            )?;
+        }
+
+        // Per-layer: input_gate + projection
+        for layer in 0..num_layers {
+            if let Some(k) = arch.per_layer_input_gate_key(layer) {
+                write_tensor(
+                    &mut ple_file,
+                    &mut entries,
+                    &mut ple_offset,
+                    k.clone(),
+                    source.get_tensor(&k),
+                )?;
+            }
+            if let Some(k) = arch.per_layer_projection_key(layer) {
+                write_tensor(
+                    &mut ple_file,
+                    &mut entries,
+                    &mut ple_offset,
+                    k.clone(),
+                    source.get_tensor(&k),
+                )?;
+            }
+        }
+
+        ple_file.flush()?;
+    }
+
     // ── LM Head ── (skipped when level < Inference)
     if write_lm_head {
         if let Some((data, rows, cols)) = source.lm_head() {
