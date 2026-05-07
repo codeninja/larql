@@ -3860,6 +3860,17 @@ fn streaming_extract_q4k_carries_ple_tensors() {
         "global PLE norm missing from loaded weights.vectors"
     );
 
+    // Per-layer `layer_scalar` survives extract → load. The forward
+    // pass multiplies h by this value after FFN; missing it produced
+    // garbage on Gemma 4 31B (chrishayuk/larql#49).
+    for layer in 0..num_layers {
+        let key = format!("layers.{layer}.layer_scalar");
+        assert!(
+            weights.vectors.contains_key(&key),
+            "layer {layer} `layer_scalar` missing from loaded weights.vectors"
+        );
+    }
+
     // final_logit_softcapping must survive the round-trip. Missing it
     // lets predict_q4k peak the softmax on the wrong token.
     let cfg = larql_vindex::load_vindex_config(&output_dir).unwrap();
@@ -3874,6 +3885,387 @@ fn streaming_extract_q4k_carries_ple_tensors() {
         weights.arch.final_logit_softcapping(),
         Some(30.0),
         "loaded arch must surface the softcap via final_logit_softcapping()"
+    );
+
+    let _ = std::fs::remove_dir_all(&model_dir);
+    let _ = std::fs::remove_dir_all(&output_dir);
+}
+
+// ─── PLE tensors survive non-Q4 (f16) extract → load round-trip ─────
+//
+// Companion regression test for chrishayuk/larql#49: same scenario as
+// `streaming_extract_q4k_carries_ple_tensors` above but with
+// `QuantFormat::None`, exercising the float `write_f32` writer path.
+// Pre-fix, that path silently dropped every PLE tensor and INFER
+// returned garbage on `larql extract gemma-4-E4B-it` (the default
+// --quant). Asserts:
+//   - `ple_weights.bin` exists in the output dir
+//   - The manifest carries the expected `tensor_f16` entries for the
+//     two global + two-per-layer PLE tensors
+//   - norms.bin contains the PLE post-norms + `layer_scalar` per layer
+//   - `load_model_weights` (the float loader) populates
+//     weights.tensors / weights.vectors with everything the validator
+//     requires — the load itself is the regression check.
+#[test]
+fn streaming_extract_f16_carries_ple_tensors() {
+    use larql_vindex::QuantFormat;
+    use std::collections::HashMap;
+
+    let model_dir = std::env::temp_dir().join("larql_test_streaming_f16_ple_model");
+    let output_dir = std::env::temp_dir().join("larql_test_streaming_f16_ple_output");
+    let _ = std::fs::remove_dir_all(&model_dir);
+    let _ = std::fs::remove_dir_all(&output_dir);
+    std::fs::create_dir_all(&model_dir).unwrap();
+
+    let hidden = 256usize;
+    let intermediate = 256usize;
+    let num_layers = 2usize;
+    let vocab = 256usize;
+    let ple_dim = 256usize;
+
+    let config = serde_json::json!({
+        "model_type": "gemma4",
+        "text_config": {
+            "model_type": "gemma4_text",
+            "hidden_size": hidden,
+            "intermediate_size": intermediate,
+            "num_hidden_layers": num_layers,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": hidden,
+            "hidden_size_per_layer_input": ple_dim,
+            "vocab_size": vocab,
+            "final_logit_softcapping": 30.0,
+        }
+    });
+    std::fs::write(
+        model_dir.join("config.json"),
+        serde_json::to_string(&config).unwrap(),
+    )
+    .unwrap();
+
+    let mut tensors: HashMap<String, Vec<f32>> = HashMap::new();
+    let mut metadata: Vec<(String, Vec<usize>)> = Vec::new();
+
+    let push = |tensors: &mut HashMap<String, Vec<f32>>,
+                metadata: &mut Vec<(String, Vec<usize>)>,
+                name: &str,
+                shape: Vec<usize>| {
+        let n: usize = shape.iter().product();
+        let data: Vec<f32> = (0..n).map(|i| (i as f32) * 0.001).collect();
+        tensors.insert(name.into(), data);
+        metadata.push((name.into(), shape));
+    };
+
+    push(
+        &mut tensors,
+        &mut metadata,
+        "model.language_model.embed_tokens.weight",
+        vec![vocab, hidden],
+    );
+    push(
+        &mut tensors,
+        &mut metadata,
+        "model.language_model.norm.weight",
+        vec![hidden],
+    );
+
+    for layer in 0..num_layers {
+        let lp = format!("model.language_model.layers.{layer}");
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.self_attn.q_proj.weight"),
+            vec![hidden, hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.self_attn.k_proj.weight"),
+            vec![hidden, hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.self_attn.v_proj.weight"),
+            vec![hidden, hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.self_attn.o_proj.weight"),
+            vec![hidden, hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.mlp.gate_proj.weight"),
+            vec![intermediate, hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.mlp.up_proj.weight"),
+            vec![intermediate, hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.mlp.down_proj.weight"),
+            vec![hidden, intermediate],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.input_layernorm.weight"),
+            vec![hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.post_attention_layernorm.weight"),
+            vec![hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.self_attn.q_norm.weight"),
+            vec![hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.self_attn.k_norm.weight"),
+            vec![hidden],
+        );
+
+        // Gemma 4 per-layer scalar.
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.layer_scalar"),
+            vec![1],
+        );
+
+        // PLE per-layer tensors.
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.per_layer_input_gate.weight"),
+            vec![ple_dim, hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.per_layer_projection.weight"),
+            vec![hidden, ple_dim],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.post_per_layer_input_norm.weight"),
+            vec![hidden],
+        );
+    }
+
+    // PLE global tensors.
+    push(
+        &mut tensors,
+        &mut metadata,
+        "model.language_model.per_layer_model_projection.weight",
+        vec![ple_dim * num_layers, hidden],
+    );
+    push(
+        &mut tensors,
+        &mut metadata,
+        "model.language_model.embed_tokens_per_layer.weight",
+        vec![vocab, ple_dim * num_layers],
+    );
+    push(
+        &mut tensors,
+        &mut metadata,
+        "model.language_model.per_layer_projection_norm.weight",
+        vec![ple_dim],
+    );
+
+    // Serialise as f32 safetensors.
+    let tensor_bytes: Vec<(String, Vec<u8>, Vec<usize>)> = metadata
+        .iter()
+        .map(|(name, shape)| {
+            let data = &tensors[name];
+            let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+            (name.clone(), bytes, shape.clone())
+        })
+        .collect();
+    let views: Vec<(String, safetensors::tensor::TensorView<'_>)> = tensor_bytes
+        .iter()
+        .map(|(name, bytes, shape)| {
+            (
+                name.clone(),
+                safetensors::tensor::TensorView::new(safetensors::Dtype::F32, shape.clone(), bytes)
+                    .unwrap(),
+            )
+        })
+        .collect();
+    let serialized = safetensors::tensor::serialize(views, &None).unwrap();
+    std::fs::write(model_dir.join("model.safetensors"), &serialized).unwrap();
+
+    let tok_json =
+        r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    std::fs::write(model_dir.join("tokenizer.json"), tok_json).unwrap();
+    let tokenizer = larql_vindex::tokenizers::Tokenizer::from_bytes(tok_json.as_bytes()).unwrap();
+
+    let mut cb = larql_vindex::SilentBuildCallbacks;
+    larql_vindex::build_vindex_streaming(
+        &model_dir,
+        &tokenizer,
+        "test/streaming-f16-ple",
+        &output_dir,
+        5,
+        // ExtractLevel::All so write_f32's `write_attn` branch (which
+        // gates the PLE sidecar emission) actually runs.
+        larql_vindex::ExtractLevel::All,
+        larql_vindex::StorageDtype::F16,
+        // The path under regression — this is the route that previously
+        // dropped every PLE tensor on real `larql extract gemma-4-E4B-it`
+        // invocations (chrishayuk/larql#49).
+        QuantFormat::None,
+        larql_vindex::WriteWeightsOptions::default(),
+        larql_vindex::Q4kWriteOptions::default(),
+        false,
+        &mut cb,
+    )
+    .unwrap();
+
+    // ── ple_weights.bin must exist ──
+    assert!(
+        output_dir.join("ple_weights.bin").exists(),
+        "non-Q4 extract should emit ple_weights.bin when arch has PLE"
+    );
+
+    // ── Manifest carries the expected tensor_f16 entries ──
+    let manifest_json = std::fs::read_to_string(output_dir.join("weight_manifest.json")).unwrap();
+    let manifest: Vec<serde_json::Value> = serde_json::from_str(&manifest_json).unwrap();
+    let ple_tensor_keys: Vec<&str> = manifest
+        .iter()
+        .filter(|e| e["kind"] == "tensor_f16")
+        .filter_map(|e| e["key"].as_str())
+        .collect();
+
+    assert_eq!(
+        ple_tensor_keys.len(),
+        2 + 2 * num_layers,
+        "expected {} PLE tensor_f16 entries, got: {:?}",
+        2 + 2 * num_layers,
+        ple_tensor_keys,
+    );
+    assert!(
+        ple_tensor_keys.contains(&"per_layer_model_projection.weight"),
+        "global model projection missing: {ple_tensor_keys:?}"
+    );
+    assert!(
+        ple_tensor_keys.contains(&"embed_tokens_per_layer.weight"),
+        "global per-layer embed missing: {ple_tensor_keys:?}"
+    );
+    for layer in 0..num_layers {
+        let g = format!("layers.{layer}.per_layer_input_gate.weight");
+        let p = format!("layers.{layer}.per_layer_projection.weight");
+        assert!(
+            ple_tensor_keys.iter().any(|k| *k == g),
+            "missing per-layer gate: {g}",
+        );
+        assert!(
+            ple_tensor_keys.iter().any(|k| *k == p),
+            "missing per-layer projection: {p}",
+        );
+    }
+    // Every PLE tensor entry must point at ple_weights.bin (not the
+    // default model_weights.bin) so the loader's mmap routing picks
+    // the right file.
+    for entry in manifest.iter().filter(|e| e["kind"] == "tensor_f16") {
+        assert_eq!(
+            entry["file"].as_str(),
+            Some("ple_weights.bin"),
+            "PLE tensor not routed to ple_weights.bin: {entry}"
+        );
+    }
+
+    // ── norms.bin carries layer_scalar + PLE post-norms ──
+    let norm_keys: Vec<&str> = manifest
+        .iter()
+        .filter(|e| e["kind"] == "vector" && e["file"].as_str() == Some("norms.bin"))
+        .filter_map(|e| e["key"].as_str())
+        .collect();
+    assert!(
+        norm_keys.contains(&"per_layer_projection_norm.weight"),
+        "global PLE projection norm missing from norms.bin: {norm_keys:?}"
+    );
+    for layer in 0..num_layers {
+        let post = format!("layers.{layer}.post_per_layer_input_norm.weight");
+        let scalar = format!("layers.{layer}.layer_scalar");
+        assert!(
+            norm_keys.iter().any(|k| *k == post),
+            "layer {layer} post-PLE norm missing from norms.bin: {norm_keys:?}"
+        );
+        assert!(
+            norm_keys.iter().any(|k| *k == scalar),
+            "layer {layer} layer_scalar missing from norms.bin: {norm_keys:?}"
+        );
+    }
+
+    // ── Load via the float loader and verify every required key
+    //     surfaces with the right shape. The load itself runs
+    //     `validate_ple_invariants`; if it returns Err, the writer
+    //     emitted something the loader doesn't accept. ──
+    let mut lcb = larql_vindex::SilentLoadCallbacks;
+    let weights = larql_vindex::load_model_weights(&output_dir, &mut lcb)
+        .expect("load_model_weights must succeed on a Gemma-4 PLE float vindex");
+
+    let proj = weights
+        .tensors
+        .get("per_layer_model_projection.weight")
+        .expect("per_layer_model_projection missing after load");
+    assert_eq!(proj.shape(), &[ple_dim * num_layers, hidden]);
+
+    let embed_ple = weights
+        .tensors
+        .get("embed_tokens_per_layer.weight")
+        .expect("embed_tokens_per_layer missing after load");
+    assert_eq!(embed_ple.shape(), &[vocab, ple_dim * num_layers]);
+
+    for layer in 0..num_layers {
+        let gate_key = format!("layers.{layer}.per_layer_input_gate.weight");
+        let proj_key = format!("layers.{layer}.per_layer_projection.weight");
+        let scalar_key = format!("layers.{layer}.layer_scalar");
+        let post_key = format!("layers.{layer}.post_per_layer_input_norm.weight");
+
+        let gate = weights
+            .tensors
+            .get(&gate_key)
+            .unwrap_or_else(|| panic!("{gate_key} missing"));
+        assert_eq!(gate.shape(), &[ple_dim, hidden]);
+
+        let proj = weights
+            .tensors
+            .get(&proj_key)
+            .unwrap_or_else(|| panic!("{proj_key} missing"));
+        assert_eq!(proj.shape(), &[hidden, ple_dim]);
+
+        assert!(
+            weights.vectors.contains_key(&scalar_key),
+            "{scalar_key} missing from weights.vectors"
+        );
+        assert!(
+            weights.vectors.contains_key(&post_key),
+            "{post_key} missing from weights.vectors"
+        );
+    }
+
+    assert!(
+        weights
+            .vectors
+            .contains_key("per_layer_projection_norm.weight"),
+        "global PLE projection norm missing from weights.vectors"
     );
 
     let _ = std::fs::remove_dir_all(&model_dir);
