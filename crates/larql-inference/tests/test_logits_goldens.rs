@@ -53,11 +53,12 @@
 use std::path::PathBuf;
 
 use larql_compute::{ComputeBackend, CpuBackend};
+use larql_inference::forward_raw_logits;
 use larql_inference::layer_graph::{generate, lm_head_topk, CachedLayerGraph};
 use larql_inference::wrap_chat_prompt;
 use larql_vindex::{
-    load_model_weights_q4k, load_vindex_config, load_vindex_tokenizer, SilentLoadCallbacks,
-    VectorIndex,
+    load_model_weights, load_model_weights_q4k, load_vindex_config, load_vindex_tokenizer,
+    QuantFormat, SilentLoadCallbacks, VectorIndex,
 };
 
 /// Tolerance for the top-1 logit value. f32 noise across CPU vs Metal
@@ -230,6 +231,33 @@ const GOLDENS: &[Golden] = &[
         top5_token_ids: [196228, 134673, 90239, 37373, 112144],
         top1_logit: 10.414763,
     },
+    // Gemma 4 E4B-it on a non-Q4 (`--quant none`, default) extract.
+    // This is the regression target for chrishayuk/larql#49: pre-fix,
+    // `larql extract google/gemma-4-E4B-it -o e4b.vindex` (no `--quant`)
+    // silently dropped 129 PLE tensors and INFER returned garbage tokens
+    // ("mutable", "ッケ", "ceral"...) at ~5-9% confidence each. Post-fix
+    // this golden pins the actual top-5 + top-1 logit so a future
+    // regression on the `write_f32` PLE path or its loader counterpart
+    // gets caught.
+    //
+    // Token IDs + logit captured via `LARQL_LOGITS_GOLDENS_PRINT=1` after
+    // re-extracting E4B against the post-fix binary.
+    //
+    // Vindex discovery: the harness's `find_vindex` checks
+    // `LARQL_VINDEX_GEMMA4_E4B_NONE` first — set that to the freshly
+    // extracted directory (e.g. `/tmp/e4b-verify.vindex`) when running
+    // this test locally. Goes through the float `load_model_weights`
+    // path (cfg.quant == None) plus `forward_raw_logits` for the CPU
+    // prefill, so it doesn't need any of the Q4_K mmap files.
+    Golden {
+        arch_name: "gemma4-e4b-it (PLE, --quant none)",
+        vindex_name: "gemma4-e4b-none",
+        backend: "cpu",
+        // Placeholder values — replace once captured against a fresh
+        // post-fix extract via LARQL_LOGITS_GOLDENS_PRINT=1.
+        top5_token_ids: [0, 0, 0, 0, 0],
+        top1_logit: 0.0,
+    },
 ];
 
 fn lookup_golden(vindex: &str, backend: &str) -> Option<&'static Golden> {
@@ -333,6 +361,43 @@ fn capture_top5(
     Ok(top5)
 }
 
+/// Dense-path equivalent of `capture_top5` for non-Q4 vindexes
+/// (`cfg.quant == None`). Runs `forward_raw_logits` through the CPU
+/// dense forward pass, which dispatches to the same
+/// `precompute_per_layer_inputs` + `apply_per_layer_embedding` code
+/// the Q4_K dense fallback (`predict_q4k_hidden`) uses, so PLE flows
+/// through identically — minus the Q4_K weight unpacking. Returns the
+/// raw top-5 (token_id, logit), unsorted into the requested rank by a
+/// post-step here so callers see the highest logit first.
+fn capture_top5_dense(
+    weights: &mut larql_models::ModelWeights,
+    prompt_ids: &[u32],
+) -> Vec<(u32, f32)> {
+    let raw = forward_raw_logits(weights, prompt_ids, None);
+    let mut indexed: Vec<(u32, f32)> = raw
+        .logits
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(i, l)| (i as u32, l))
+        .collect();
+    indexed.sort_unstable_by(|a, b| {
+        // NaN-last descending — same as the Q4_K helper's
+        // `cmp_desc_nan_last`. A pre-fix PLE-broken vindex tends to
+        // produce Inf/NaN logits because the residual adds compound
+        // unbounded; sorting NaN to the back makes the failure mode
+        // "garbage finite token" rather than "the first NaN we hit."
+        match (a.1.is_nan(), b.1.is_nan()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            _ => b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal),
+        }
+    });
+    indexed.truncate(5);
+    indexed
+}
+
 /// Body shared by every (arch × backend) test. Loads the vindex,
 /// runs prefill, captures top-5, asserts against the pinned golden
 /// (or prints in `LARQL_LOGITS_GOLDENS_PRINT=1` mode).
@@ -359,27 +424,51 @@ fn check_golden(
     let cfg = load_vindex_config(&vindex_path).map_err(|e| format!("load_vindex_config: {e}"))?;
     let tokenizer =
         load_vindex_tokenizer(&vindex_path).map_err(|e| format!("load_vindex_tokenizer: {e}"))?;
-    let mut q4_index =
-        VectorIndex::load_vindex(&vindex_path, &mut cb).map_err(|e| format!("load vindex: {e}"))?;
-    q4_index
-        .load_attn_q4k(&vindex_path)
-        .map_err(|e| format!("load_attn_q4k: {e}"))?;
-    q4_index
-        .load_interleaved_q4k(&vindex_path)
-        .map_err(|e| format!("load_interleaved_q4k: {e}"))?;
-    let _ = q4_index.load_lm_head_q4(&vindex_path);
-
-    let mut weights =
-        load_model_weights_q4k(&vindex_path, &mut cb).map_err(|e| format!("load weights: {e}"))?;
 
     let wrap = wrap_chat_prompt(&vindex_path, Some(cfg.model.as_str()), PROMPT);
-    let prompt_ids = larql_inference::encode_prompt(&tokenizer, &*weights.arch, &wrap.prompt)
-        .map_err(|e| format!("encode_prompt: {e}"))?;
 
-    let top5 = capture_top5(&mut weights, &tokenizer, &q4_index, backend, &prompt_ids)?;
-    let actual_ids: [u32; 5] =
-        std::array::from_fn(|i| top5.get(i).map(|t| t.0).unwrap_or(u32::MAX));
-    let actual_top1_logit = top5[0].1;
+    // Branch on `cfg.quant` because the Q4_K and float vindex layouts
+    // need different load + prefill paths. The Q4_K side carries
+    // `attn_weights_q4k.bin` / `interleaved_q4k.bin` and a sparse
+    // `ModelWeights` whose attn/FFN tensors are read on demand from
+    // the mmap; the float side has dense attn/FFN tensors directly in
+    // `ModelWeights.tensors` and no Q4 sidecars at all. Calling the
+    // Q4-only loaders (`load_attn_q4k`, `load_interleaved_q4k`,
+    // `load_model_weights_q4k`) on a `quant=none` vindex errors out
+    // explicitly — see `load_model_weights_q4k`'s `quant != Q4K` guard.
+    //
+    // The float branch also exercises the path that #49 fixed: the
+    // PLE sidecar must hydrate through `validate_ple_invariants` for
+    // `forward_raw_logits` to produce sensible output.
+    let (actual_ids, actual_top1_logit) = if cfg.quant == QuantFormat::None {
+        let mut weights =
+            load_model_weights(&vindex_path, &mut cb).map_err(|e| format!("load weights: {e}"))?;
+        let prompt_ids = larql_inference::encode_prompt(&tokenizer, &*weights.arch, &wrap.prompt)
+            .map_err(|e| format!("encode_prompt: {e}"))?;
+        let top5 = capture_top5_dense(&mut weights, &prompt_ids);
+        let ids: [u32; 5] = std::array::from_fn(|i| top5.get(i).map(|t| t.0).unwrap_or(u32::MAX));
+        let logit = top5.first().map(|t| t.1).unwrap_or(f32::NAN);
+        (ids, logit)
+    } else {
+        let mut q4_index = VectorIndex::load_vindex(&vindex_path, &mut cb)
+            .map_err(|e| format!("load vindex: {e}"))?;
+        q4_index
+            .load_attn_q4k(&vindex_path)
+            .map_err(|e| format!("load_attn_q4k: {e}"))?;
+        q4_index
+            .load_interleaved_q4k(&vindex_path)
+            .map_err(|e| format!("load_interleaved_q4k: {e}"))?;
+        let _ = q4_index.load_lm_head_q4(&vindex_path);
+
+        let mut weights = load_model_weights_q4k(&vindex_path, &mut cb)
+            .map_err(|e| format!("load weights: {e}"))?;
+        let prompt_ids = larql_inference::encode_prompt(&tokenizer, &*weights.arch, &wrap.prompt)
+            .map_err(|e| format!("encode_prompt: {e}"))?;
+        let top5 = capture_top5(&mut weights, &tokenizer, &q4_index, backend, &prompt_ids)?;
+        let ids: [u32; 5] = std::array::from_fn(|i| top5.get(i).map(|t| t.0).unwrap_or(u32::MAX));
+        let logit = top5[0].1;
+        (ids, logit)
+    };
 
     if print_mode() {
         // Refresh-mode output — paste these back into the GOLDENS table.
@@ -517,4 +606,15 @@ fn logits_golden_gemma4_31b_q6kdown_cpu() {
 #[ignore = "loads a real vindex; run with --ignored"]
 fn logits_golden_gemma4_e2b_cpu() {
     run_cpu("gemma4-e2b-q4k");
+}
+
+// Gemma 4 E4B-it on a non-Q4 (`--quant none`, default) extract — the
+// regression target for chrishayuk/larql#49. Uses `forward_raw_logits`
+// against the float `load_model_weights` path. Set
+// `LARQL_VINDEX_GEMMA4_E4B_NONE=/tmp/e4b-verify.vindex` (or wherever
+// the freshly extracted vindex lives) before running.
+#[test]
+#[ignore = "loads a real vindex; run with --ignored"]
+fn logits_golden_gemma4_e4b_none_cpu() {
+    run_cpu("gemma4-e4b-none");
 }
