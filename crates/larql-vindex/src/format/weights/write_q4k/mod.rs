@@ -17,6 +17,11 @@ use crate::extract::callbacks::IndexBuildCallbacks;
 use crate::format::filenames::*;
 
 use super::capabilities::{ensure_standard_attention_supported, SURFACE_Q4K_WEIGHT_WRITER};
+use super::ple_sidecar::{
+    per_layer_norm_keys as ple_per_layer_norm_keys,
+    write_global_projection_norm as ple_write_global_projection_norm,
+    write_ple_weights_bin,
+};
 use super::write_f32::{kind, WeightEntry, WeightSource};
 
 // ── Q4_K / Q6_K streaming writer ──────────────────────────────────────────
@@ -362,28 +367,22 @@ pub fn write_model_weights_q4k_with_opts(
     let mut norm_entries: Vec<WeightEntry> = Vec::new();
 
     for layer in 0..num_layers {
-        let keys: Vec<String> = [
+        let mut keys: Vec<String> = [
             Some(arch.input_layernorm_key(layer)),
             Some(arch.post_attention_layernorm_key(layer)),
             arch.pre_feedforward_layernorm_key(layer),
             arch.post_feedforward_layernorm_key(layer),
             arch.attn_q_norm_key(layer),
             arch.attn_k_norm_key(layer),
-            // Gemma 4 per-layer scalar multiplier. Stored as a 0-D scalar
-            // in safetensors, surfaced through WeightSource as a 1-element
-            // vector. The forward path multiplies h by this value after
-            // FFN; omitting it silently produced garbage on 31B.
-            arch.layer_scalar_key(layer),
-            // Gemma 4 E2B per-layer embedding post-norm.
-            if arch.has_per_layer_embeddings() {
-                arch.post_per_layer_input_norm_key(layer)
-            } else {
-                None
-            },
         ]
         .into_iter()
         .flatten()
         .collect();
+
+        // Gemma 4 PLE-related per-layer 1-D vectors (`layer_scalar`,
+        // `post_per_layer_input_norm`). Shared with the float writer
+        // so both extract kinds emit byte-identical norm sets.
+        keys.extend(ple_per_layer_norm_keys(arch, layer));
 
         for key in keys {
             if let Some(data) = source.get_vector(&key) {
@@ -470,109 +469,29 @@ pub fn write_model_weights_q4k_with_opts(
         norms_offset += bytes.len() as u64;
     }
 
-    // Gemma 4 E2B PLE global projection norm (small vector).
-    if arch.has_per_layer_embeddings() {
-        if let Some(data) = source.get_vector("per_layer_projection_norm.weight") {
-            let bytes = crate::config::dtype::encode_floats(&data, norms_dtype);
-            norms_file.write_all(&bytes)?;
-            norm_entries.push(WeightEntry {
-                key: "per_layer_projection_norm.weight".into(),
-                kind: kind::VECTOR.into(),
-                shape: vec![data.len()],
-                offset: norms_offset,
-                length: bytes.len() as u64,
-                file: NORMS_BIN.into(),
-            });
-        }
-    }
+    // Gemma 4 E2B/E4B PLE global projection norm. Helper is shared
+    // with the float writer so both extracts emit identical layouts.
+    ple_write_global_projection_norm(
+        source,
+        &mut norms_file,
+        &mut norm_entries,
+        &mut norms_offset,
+        norms_dtype,
+    )?;
     norms_file.flush()?;
     drop(norms_file);
 
-    // ── ple_weights.bin — Per-Layer Embedding tensors (Gemma 4 E2B only) ──
+    // ── ple_weights.bin — Per-Layer Embedding 2-D tensors ──
     //
-    // Stored as f16 — NOT Q4_K. The two globals (`per_layer_model_projection`,
-    // `embed_tokens_per_layer`) and the per-layer input_gate/projection
-    // matrices behave like embedding tables: each super-block of 256 values
-    // spans a wide dynamic range with a handful of outliers, and Q4_K's
-    // per-super-block (d, dmin) calibration zeros out the majority of cells
-    // to accommodate those outliers. PLE contributions are additive into
-    // every layer's residual, so the cell-level noise compounds across 35
-    // layers — the observable result was "arrays" / "amphibians" instead
-    // of "Paris" on Gemma 4 E2B. f16 halves the BF16 footprint (~4.7 GB for
-    // the big lookup on E2B) and preserves enough precision for accurate
-    // per-token PLE retrieval.
-    if arch.has_per_layer_embeddings() {
-        let ple_path = dir.join("ple_weights.bin");
-        let mut ple_file = BufWriter::new(std::fs::File::create(&ple_path)?);
-        let mut ple_offset: u64 = 0;
-        let ple_dtype = crate::config::dtype::StorageDtype::F16;
-
-        let write_tensor = |file: &mut BufWriter<std::fs::File>,
-                            manifest: &mut Vec<WeightEntry>,
-                            offset: &mut u64,
-                            key: String,
-                            data: Option<(Vec<f32>, usize, usize)>|
-         -> Result<(), VindexError> {
-            if let Some((floats, rows, cols)) = data {
-                let bytes = crate::config::dtype::encode_floats(&floats, ple_dtype);
-                file.write_all(&bytes)?;
-                manifest.push(WeightEntry {
-                    key,
-                    kind: kind::TENSOR_F16.into(),
-                    shape: vec![rows, cols],
-                    offset: *offset,
-                    length: bytes.len() as u64,
-                    file: "ple_weights.bin".into(),
-                });
-                *offset += bytes.len() as u64;
-            }
-            Ok(())
-        };
-
-        // Global: model projection [ple_dim·num_layers, hidden]
-        write_tensor(
-            &mut ple_file,
-            &mut norm_entries,
-            &mut ple_offset,
-            "per_layer_model_projection.weight".into(),
-            source.get_tensor("per_layer_model_projection.weight"),
-        )?;
-
-        // Global: big embedding table [vocab, ple_dim·num_layers]
-        if let Some(key) = arch.per_layer_embed_key() {
-            write_tensor(
-                &mut ple_file,
-                &mut norm_entries,
-                &mut ple_offset,
-                key.clone(),
-                source.get_tensor(&key),
-            )?;
-        }
-
-        // Per-layer: input_gate + projection
-        for layer in 0..num_layers {
-            if let Some(k) = arch.per_layer_input_gate_key(layer) {
-                write_tensor(
-                    &mut ple_file,
-                    &mut norm_entries,
-                    &mut ple_offset,
-                    k.clone(),
-                    source.get_tensor(&k),
-                )?;
-            }
-            if let Some(k) = arch.per_layer_projection_key(layer) {
-                write_tensor(
-                    &mut ple_file,
-                    &mut norm_entries,
-                    &mut ple_offset,
-                    k.clone(),
-                    source.get_tensor(&k),
-                )?;
-            }
-        }
-
-        ple_file.flush()?;
-    }
+    // The four 2-D PLE tensors (two globals + two per-layer) live in
+    // a sidecar bin as f16, NOT Q4_K. f16 halves the BF16 footprint
+    // (~4.7 GB for the big lookup on E2B) while preserving enough
+    // precision; Q4_K's per-super-block (d, dmin) calibration zeros
+    // out non-outlier cells of embedding-style tensors and the
+    // resulting noise compounds across every layer's PLE residual
+    // add (observably: "arrays" / "amphibians" instead of "Paris" on
+    // E2B). Helper shared with the float writer.
+    write_ple_weights_bin(source, dir, &mut norm_entries)?;
 
     // ── lm_head_q4.bin ──
     if let Some((data, rows, cols)) = source.lm_head() {

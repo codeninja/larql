@@ -25,6 +25,11 @@ use crate::format::filenames::*;
 use crate::format::load::load_vindex_config;
 
 use super::capabilities::{ensure_standard_attention_supported, SURFACE_F32_WEIGHT_WRITER};
+use super::ple_sidecar::{
+    per_layer_norm_keys as ple_per_layer_norm_keys,
+    write_global_projection_norm as ple_write_global_projection_norm,
+    write_ple_weights_bin,
+};
 use larql_models::ModelWeights;
 
 /// Manifest `kind` discriminators — wire-format strings written into
@@ -469,26 +474,16 @@ pub fn write_model_weights_with_opts(
                 Some(arch.post_attention_layernorm_key(layer)),
                 arch.pre_feedforward_layernorm_key(layer),
                 arch.post_feedforward_layernorm_key(layer),
-                // Gemma 4 per-layer scalar multiplier — stored as a 0-D
-                // scalar in safetensors, surfaced through `WeightSource`
-                // as a 1-element vector. The forward path multiplies h
-                // by this value after FFN; omitting it silently produced
-                // garbage on Gemma 4 31B and (for E4B) was one of two
-                // tensors missing on the float-extract path before #49.
-                arch.layer_scalar_key(layer),
-                // Gemma 4 E2B/E4B per-layer-embedding post-norm. Required
-                // by `apply_per_layer_embedding`; missing it on a float
-                // extract reduced the PLE residual add to a no-op even
-                // when the four 2-D PLE tensors landed correctly.
-                if arch.has_per_layer_embeddings() {
-                    arch.post_per_layer_input_norm_key(layer)
-                } else {
-                    None
-                },
             ]
             .into_iter()
             .flatten()
             .collect();
+
+            // Gemma 4 PLE-related per-layer 1-D vectors (`layer_scalar`,
+            // `post_per_layer_input_norm`). Helper returns the right
+            // subset for the architecture; non-Gemma-4 archs get an
+            // empty vec and norms.bin layout is byte-identical.
+            norm_keys.extend(ple_per_layer_norm_keys(arch, layer));
 
             // Hybrid MoE additions: the pre_2/post_1/post_2 weights plus
             // the outer post_feedforward_layernorm that wraps (h1+h2).
@@ -540,118 +535,33 @@ pub fn write_model_weights_with_opts(
             norms_offset += bytes.len() as u64;
         }
 
-        // Gemma 4 E2B/E4B PLE global projection norm (small vector).
-        // Companion to per_layer_model_projection — applied during
-        // `precompute_per_layer_inputs` (forward/ple.rs:49). Belongs
-        // here, not in ple_weights.bin, because it's a 1-D RMSNorm
-        // weight just like the rest of the norms in this file.
-        if arch.has_per_layer_embeddings() {
-            if let Some(data) = source.get_vector("per_layer_projection_norm.weight") {
-                let bytes = crate::config::dtype::encode_floats(&data, dtype);
-                norms_file.write_all(&bytes)?;
-                entries.push(WeightEntry {
-                    key: "per_layer_projection_norm.weight".into(),
-                    kind: kind::VECTOR.into(),
-                    shape: vec![data.len()],
-                    offset: norms_offset,
-                    length: bytes.len() as u64,
-                    file: NORMS_BIN.into(),
-                });
-            }
-        }
+        // Gemma 4 E2B/E4B PLE global projection norm — small 1-D
+        // vector applied during `precompute_per_layer_inputs`. Lives
+        // here, not in ple_weights.bin, because norms.bin is the
+        // home for every other 1-D RMSNorm weight.
+        ple_write_global_projection_norm(
+            source,
+            &mut norms_file,
+            &mut entries,
+            &mut norms_offset,
+            dtype,
+        )?;
         norms_file.flush()?;
     }
 
-    // ── ple_weights.bin — Per-Layer Embedding tensors (Gemma 4 E2B/E4B) ──
+    // ── ple_weights.bin — Per-Layer Embedding 2-D tensors ──
     //
-    // Mirror of the Q4_K writer's PLE block (see
-    // `write_q4k/mod.rs::write_model_weights_q4k_with_opts` ~lines 491-575).
-    // The four PLE 2-D tensors land in a sidecar `ple_weights.bin` as f16,
-    // *not* in the main float weight files — the on-disk layout matches the
-    // Q4_K extract so the same loader path can hydrate either kind. f16
-    // (instead of the global `dtype`) is deliberate: Q4_K writers chose f16
-    // for these tensors because Q4_K's per-super-block calibration zeros
-    // out non-outlier cells of embedding-style tensors and the resulting
-    // noise compounds across every layer's PLE residual add. f16 keeps
-    // float extracts on the same precision floor as q4k extracts so the
-    // same loader and forward-pass code can drive both without surprise.
+    // The four 2-D PLE tensors (two globals + two per-layer) live in
+    // a sidecar bin as f16. Helper is shared with the Q4_K writer so
+    // both extract kinds emit byte-identical PLE sidecars; see
+    // `ple_sidecar.rs` for the layout rationale.
     //
-    // Without this block, extracting `gemma-4-E4B-it` at `--quant none`
-    // silently drops 129 PLE tensors and `precompute_per_layer_inputs`
-    // returns an empty `Vec` at inference time — INFER then produces
-    // garbage with no warning. See chrishayuk/larql#49 for the full
-    // diagnosis.
-    if write_attn && arch.has_per_layer_embeddings() {
-        let ple_path = dir.join(PLE_WEIGHTS_BIN);
-        let mut ple_file = BufWriter::new(std::fs::File::create(&ple_path)?);
-        let mut ple_offset: u64 = 0;
-        let ple_dtype = crate::config::dtype::StorageDtype::F16;
-
-        let write_tensor = |file: &mut BufWriter<std::fs::File>,
-                            manifest: &mut Vec<WeightEntry>,
-                            offset: &mut u64,
-                            key: String,
-                            data: Option<(Vec<f32>, usize, usize)>|
-         -> Result<(), VindexError> {
-            if let Some((floats, rows, cols)) = data {
-                let bytes = crate::config::dtype::encode_floats(&floats, ple_dtype);
-                file.write_all(&bytes)?;
-                manifest.push(WeightEntry {
-                    key,
-                    kind: kind::TENSOR_F16.into(),
-                    shape: vec![rows, cols],
-                    offset: *offset,
-                    length: bytes.len() as u64,
-                    file: PLE_WEIGHTS_BIN.into(),
-                });
-                *offset += bytes.len() as u64;
-            }
-            Ok(())
-        };
-
-        // Global: model projection [ple_dim·num_layers, hidden]
-        write_tensor(
-            &mut ple_file,
-            &mut entries,
-            &mut ple_offset,
-            "per_layer_model_projection.weight".into(),
-            source.get_tensor("per_layer_model_projection.weight"),
-        )?;
-
-        // Global: per-token embedding table [vocab, ple_dim·num_layers]
-        if let Some(key) = arch.per_layer_embed_key() {
-            write_tensor(
-                &mut ple_file,
-                &mut entries,
-                &mut ple_offset,
-                key.clone(),
-                source.get_tensor(&key),
-            )?;
-        }
-
-        // Per-layer: input_gate + projection
-        for layer in 0..num_layers {
-            if let Some(k) = arch.per_layer_input_gate_key(layer) {
-                write_tensor(
-                    &mut ple_file,
-                    &mut entries,
-                    &mut ple_offset,
-                    k.clone(),
-                    source.get_tensor(&k),
-                )?;
-            }
-            if let Some(k) = arch.per_layer_projection_key(layer) {
-                write_tensor(
-                    &mut ple_file,
-                    &mut entries,
-                    &mut ple_offset,
-                    k.clone(),
-                    source.get_tensor(&k),
-                )?;
-            }
-        }
-
-        ple_file.flush()?;
+    // Gated on `write_attn` rather than `write_ffn` to match the q4k
+    // writer's coupling: the loader's PLE validator runs whenever
+    // `arch.has_per_layer_embeddings()` and the manifest is loaded,
+    // and the manifest is only written on `level >= Attention`.
+    if write_attn {
+        write_ple_weights_bin(source, dir, &mut entries)?;
     }
 
     // ── LM Head ── (skipped when level < Inference)
