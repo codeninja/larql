@@ -3667,6 +3667,17 @@ fn streaming_extract_q4k_carries_ple_tensors() {
             vec![hidden],
         );
 
+        // Gemma 4 per-layer scalar — required by the load-time PLE
+        // invariant validator (chrishayuk/larql#49). Stored as a 1-D
+        // length-1 tensor here because that's how the safetensors-on-disk
+        // shape surfaces through `WeightSource::get_vector`.
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.layer_scalar"),
+            vec![1],
+        );
+
         // ── PLE per-layer tensors (the regression surface) ──
         push(
             &mut tensors,

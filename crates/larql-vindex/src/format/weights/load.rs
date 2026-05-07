@@ -290,6 +290,20 @@ pub fn load_model_weights_with_opts(
                     tensors.insert(entry.key.clone(), arr.into_shared());
                 }
             }
+            kind::TENSOR_F16 => {
+                // 2-D f16 sidecar tensor — used for Gemma 4 PLE weights
+                // in `ple_weights.bin`. The byte-count → dtype detection
+                // above already decoded the raw f16 to f32; just reshape
+                // into the manifest-recorded [rows, cols] and stuff it
+                // into `weights.tensors` so the forward pass looks it up
+                // like any other dense matrix.
+                if entry.shape.len() != 2 {
+                    continue;
+                }
+                let arr = Array2::from_shape_vec((entry.shape[0], entry.shape[1]), floats)
+                    .map_err(|e| VindexError::Parse(e.to_string()))?;
+                tensors.insert(entry.key.clone(), arr.into_shared());
+            }
             kind::VECTOR => {
                 vectors.insert(entry.key.clone(), floats);
             }
@@ -357,6 +371,13 @@ pub fn load_model_weights_with_opts(
     callbacks.on_file_done("model_weights", entries.len(), 0.0);
 
     let cfg = arch.config();
+
+    // Hard-fail if PLE / Gemma-4 invariants don't hold. The forward
+    // pass used to silently no-op on missing PLE tensors and produce
+    // garbage; surfacing the missing keys at load time lets the
+    // user re-extract before INFER ever runs (chrishayuk/larql#49).
+    validate_ple_invariants(&*arch, cfg.num_layers, &tensors, &vectors)?;
+
     let embed = embed.into_shared();
     // Embed-tied fallback: models like Gemma share embed ↔ lm_head
     // weights. When the caller asked to skip lm_head we don't want to
@@ -703,6 +724,13 @@ pub fn load_model_weights_q4k_shard(
     }
 
     let cfg = arch.config();
+
+    // Same PLE invariant check as the float loader — Q4_K extracts
+    // store PLE tensors as `tensor_f16` in `ple_weights.bin` exactly
+    // like the float path, so the same set of keys must surface in
+    // `tensors` / `vectors` before forward.
+    validate_ple_invariants(&*arch, cfg.num_layers, &tensors, &vectors)?;
+
     let embed = embed.into_shared();
     let lm_head = lm_head_loaded.unwrap_or_else(|| embed.clone());
 
@@ -725,6 +753,104 @@ pub fn load_model_weights_q4k_shard(
         rope_base: cfg.rope_base,
         arch,
     })
+}
+
+/// Verify that a freshly-loaded vindex contains every tensor + vector
+/// that `arch`'s forward pass will ask for at inference time. Returns
+/// a `VindexError::Parse` listing every missing key when one or more
+/// PLE / Gemma-4 invariants fails, with a hint to re-extract.
+///
+/// Why this is hard-fail rather than warn: the PLE forward path in
+/// `larql-inference/src/forward/ple.rs` previously fell through with
+/// `return Vec::new()` / `return h.clone()` on missing tensors, which
+/// silently no-op'd the per-layer additive contribution and produced
+/// near-random predictions (chrishayuk/larql#49). Failing at load
+/// time means the user gets a clear "rebuild this vindex" message
+/// instead of garbage from INFER hours later.
+fn validate_ple_invariants(
+    arch: &dyn larql_models::ModelArchitecture,
+    num_layers: usize,
+    tensors: &HashMap<String, larql_models::WeightArray>,
+    vectors: &HashMap<String, Vec<f32>>,
+) -> Result<(), VindexError> {
+    let mut missing_tensors: Vec<String> = Vec::new();
+    let mut missing_vectors: Vec<String> = Vec::new();
+
+    if arch.has_per_layer_embeddings() {
+        // Two globals + two-per-layer 2-D tensors must be in
+        // `tensors` (`ple_weights.bin` `tensor_f16` entries on float
+        // extracts; same source, different decode path on Q4_K
+        // extracts — load_model_weights_q4k decodes them via the
+        // same TENSOR_F16 branch in load.rs's manifest loop).
+        if !tensors.contains_key("per_layer_model_projection.weight") {
+            missing_tensors.push("per_layer_model_projection.weight".into());
+        }
+        if let Some(key) = arch.per_layer_embed_key() {
+            if !tensors.contains_key(&key) {
+                missing_tensors.push(key);
+            }
+        }
+        for layer in 0..num_layers {
+            if let Some(key) = arch.per_layer_input_gate_key(layer) {
+                if !tensors.contains_key(&key) {
+                    missing_tensors.push(key);
+                }
+            }
+            if let Some(key) = arch.per_layer_projection_key(layer) {
+                if !tensors.contains_key(&key) {
+                    missing_tensors.push(key);
+                }
+            }
+            // 1-D PLE post-norm vectors (norms.bin).
+            if let Some(key) = arch.post_per_layer_input_norm_key(layer) {
+                if !vectors.contains_key(&key) {
+                    missing_vectors.push(key);
+                }
+            }
+        }
+        // Global PLE projection norm (norms.bin).
+        if !vectors.contains_key("per_layer_projection_norm.weight") {
+            missing_vectors.push("per_layer_projection_norm.weight".into());
+        }
+    }
+
+    // Gemma 4: per-layer scalar multiplier. Applies whether or not
+    // PLE is active (Gemma 4 31B is dense-only but still uses
+    // `layer_scalar`), so the gate is `layer_scalar_key(...).is_some()`,
+    // not `has_per_layer_embeddings()`.
+    for layer in 0..num_layers {
+        if let Some(key) = arch.layer_scalar_key(layer) {
+            if !vectors.contains_key(&key) {
+                missing_vectors.push(key);
+            }
+        }
+    }
+
+    if missing_tensors.is_empty() && missing_vectors.is_empty() {
+        return Ok(());
+    }
+
+    let mut msg = String::from(
+        "vindex is missing required Gemma-4 weights — rebuild it with current larql:\n\
+         \n\
+         An older `larql extract` (pre-#49 fix) silently dropped these \
+         tensors when run with --quant none / --quant f16. INFER on \
+         this vindex would return garbage.\n",
+    );
+    if !missing_tensors.is_empty() {
+        msg.push_str("\n  Missing tensors (expected in ple_weights.bin):\n");
+        for k in &missing_tensors {
+            msg.push_str(&format!("    - {k}\n"));
+        }
+    }
+    if !missing_vectors.is_empty() {
+        msg.push_str("\n  Missing vectors (expected in norms.bin):\n");
+        for k in &missing_vectors {
+            msg.push_str(&format!("    - {k}\n"));
+        }
+    }
+    msg.push_str("\nFix:\n  larql extract <model> -o <vindex> --force\n");
+    Err(VindexError::Parse(msg))
 }
 
 /// Find the tokenizer path near a model or vindex directory.
