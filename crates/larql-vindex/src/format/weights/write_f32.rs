@@ -469,6 +469,22 @@ pub fn write_model_weights_with_opts(
                 Some(arch.post_attention_layernorm_key(layer)),
                 arch.pre_feedforward_layernorm_key(layer),
                 arch.post_feedforward_layernorm_key(layer),
+                // Gemma 4 per-layer scalar multiplier — stored as a 0-D
+                // scalar in safetensors, surfaced through `WeightSource`
+                // as a 1-element vector. The forward path multiplies h
+                // by this value after FFN; omitting it silently produced
+                // garbage on Gemma 4 31B and (for E4B) was one of two
+                // tensors missing on the float-extract path before #49.
+                arch.layer_scalar_key(layer),
+                // Gemma 4 E2B/E4B per-layer-embedding post-norm. Required
+                // by `apply_per_layer_embedding`; missing it on a float
+                // extract reduced the PLE residual add to a no-op even
+                // when the four 2-D PLE tensors landed correctly.
+                if arch.has_per_layer_embeddings() {
+                    arch.post_per_layer_input_norm_key(layer)
+                } else {
+                    None
+                },
             ]
             .into_iter()
             .flatten()
@@ -521,6 +537,27 @@ pub fn write_model_weights_with_opts(
                 length: bytes.len() as u64,
                 file: NORMS_BIN.into(),
             });
+            norms_offset += bytes.len() as u64;
+        }
+
+        // Gemma 4 E2B/E4B PLE global projection norm (small vector).
+        // Companion to per_layer_model_projection — applied during
+        // `precompute_per_layer_inputs` (forward/ple.rs:49). Belongs
+        // here, not in ple_weights.bin, because it's a 1-D RMSNorm
+        // weight just like the rest of the norms in this file.
+        if arch.has_per_layer_embeddings() {
+            if let Some(data) = source.get_vector("per_layer_projection_norm.weight") {
+                let bytes = crate::config::dtype::encode_floats(&data, dtype);
+                norms_file.write_all(&bytes)?;
+                entries.push(WeightEntry {
+                    key: "per_layer_projection_norm.weight".into(),
+                    kind: kind::VECTOR.into(),
+                    shape: vec![data.len()],
+                    offset: norms_offset,
+                    length: bytes.len() as u64,
+                    file: NORMS_BIN.into(),
+                });
+            }
         }
         norms_file.flush()?;
     }
